@@ -880,17 +880,31 @@ export class Ky {
 	// the caller's `.json()`/`.text()`/etc. promise must settle, so a timeout here always rejects.
 	async #raceBodyRead(createBodyPromise: () => Promise<unknown>, response: Response): Promise<unknown> {
 		const failedRequest = this.#getResponseRequest(response);
+		const abortSignal = this.#userProvidedAbortSignal;
 		let timeoutMilliseconds: number | undefined;
 		try {
+			abortSignal?.throwIfAborted();
 			timeoutMilliseconds = this.#getEffectiveTimeout();
 		} catch (error: unknown) {
 			await this.#throwProcessedError(error, failedRequest);
 		}
 
-		const bodyPromise = createBodyPromise();
-
+		let abortListener: (() => void) | undefined;
 		let result: unknown;
 		try {
+			const abortPromise = new Promise<never>((_resolve, reject) => {
+				if (!abortSignal) {
+					return;
+				}
+
+				abortListener = () => {
+					// eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- AbortSignal reasons can be any value and must be preserved exactly.
+					reject(abortSignal.reason);
+				};
+
+				abortSignal.addEventListener('abort', abortListener, {once: true});
+			});
+			const bodyPromise = Promise.race([createBodyPromise(), abortPromise]);
 			result = timeoutMilliseconds === undefined
 				? await bodyPromise
 				: await raceWithTimeout(bodyPromise, timeoutMilliseconds);
@@ -910,6 +924,10 @@ export class Ky {
 			}
 
 			result = timedOut;
+		} finally {
+			if (abortListener) {
+				abortSignal?.removeEventListener('abort', abortListener);
+			}
 		}
 
 		// A cancellation is part of the request lifecycle, so it must not resolve as a successful body read just because the bytes happened to arrive first. `.json()` already gets this check for free through `#raceWithTotalTimeout()`, which is why the shortcuts used to disagree here.
